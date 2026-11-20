@@ -3,201 +3,264 @@ require "yaml"
 
 module Vagrant_Dev_Sys
   PROJECT_DIR = Pathname.new(__FILE__).dirname.relative_path_from(Pathname.getwd)
-  CONFIG_FILE = PROJECT_DIR + "config.yml"
+  CONFIG_FILE = "config.yml"
+  CONFIG_PATH = PROJECT_DIR + CONFIG_FILE
 
   # Vagrantfile API/syntax version. Do not change this unless you know what you're doing!
   VAGRANTFILE_API_VERSION = "2"
 
   # Configure the VMs.
   def self.configure
-    if !(CONFIG_FILE).file?
-      puts "Error: #{CONFIG_FILE} is missing."
+    if !(CONFIG_PATH).file?
+      puts "Error: #{CONFIG_PATH} is missing."
       exit!
     end
 
-    config_file = YAML.load_file(CONFIG_FILE)
-    default_options = config_file["defaults"]
+    config_file = YAML.load_file(CONFIG_PATH)
+    virtual_machines = get_array(nil, config_file, "virtual_machines", default: [])
 
     Vagrant.configure(VAGRANTFILE_API_VERSION) do |config|
-      config_file["virtual_machines"].each do |vm_options|
-        options = merge_options(vm_options, default_options)
-        provider = options.key?("provider") ? options["provider"] : "virtualbox"
+      virtual_machines.each do |options|
+        hostname = get_string(nil, options, "hostname", required: true)
+        autostart = get_boolean(hostname, options, "autostart", default: false)
+        provider = get_string(hostname, options, "provider", default: "virtualbox")
+
         if provider == "digitalocean"
-          configure_digitalocean(config, options)
+          configure_digitalocean(hostname, config, options, autostart)
+        elsif provider == "virtualbox"
+          configure_virtualbox(hostname, config, options, autostart)
+        else
+          raise ArgumentError, "#{hostname}: Unsupported provider '#{provider}'."
         end
-        if provider == "virtualbox"
-          configure_virtualbox(config, options)
-        end
-      end  # config_file ... do |vm_options|
+      end  # virtual_machines.each do |options|
     end  # Vagrant.configure ...  do |config|
   end  # def self.configure
 
   # Configure a DigitalOcean VM.
-  def self.configure_digitalocean(config, options)
-    autostart = options.key?("autostart") ? options["autostart"] : false
-    vm_name = options["hostname"]
+  def self.configure_digitalocean(hostname, config, options, autostart)
+    digitalocean = get_hash(hostname, options, "digitalocean", required: true)
     options["user"] = "root"
     options["group"] = "root"
-    provider_options = options["digitalocean"]
 
-    config.vm.define vm_name, autostart: autostart do |sys|
+    config.vm.define hostname, autostart: autostart do |sys|
+      sys.ssh.private_key_path = get_string(hostname, digitalocean, "private_key_file", required: true)
       sys.vm.box = "digital_ocean"
-      sys.vm.hostname = vm_name
-      sys.ssh.private_key_path = provider_options["private_key_file"]
+      sys.vm.hostname = hostname
       sys.vm.provider "digital_ocean" do |provider|
-        provider.token = provider_options["api_token"]
-        provider.image = provider_options.key?("image") ? provider_options["image"] : "ubuntu-18-04-x64"
-        provider.region = provider_options.key?("region") ? provider_options["region"] : "nyc1"
-        provider.size = provider_options.key?("size") ? provider_options["size"] : "4gb"
-        provider.ssh_key_name = provider_options["ssh_key_name"]
+        provider.image = get_string(hostname, digitalocean, "image", default: "ubuntu-26-04-x64")
+        provider.region = get_string(hostname, digitalocean, "region", default: "nyc2")
+        provider.size = get_string(hostname, digitalocean, "size", default: "s-2vcpu-4gb")
+        provider.ssh_key_name = get_string(hostname, digitalocean, "ssh_key_name", required: true)
+        provider.token = get_string(hostname, digitalocean, "api_token", required: true)
       end  # sys.vm.provider ... do |provider|
 
-      synced_folders(sys, options)
-      provision(sys, options)
+      synced_directories(hostname, sys, options)
+      provision(hostname, sys, options)
     end  # config.vm.define ... do |sys|
   end  # def self.configure_digitalocean()
 
   # Configure a VirtualBox VM.
-  def self.configure_virtualbox(config, options)
-    autostart = options.key?("autostart") ? options["autostart"] : false
-    vm_name = options["hostname"]
+  def self.configure_virtualbox(hostname, config, options, autostart)
+    virtualbox = get_hash(hostname, options, "virtualbox", default: {})
     options["user"] = "vagrant"
     options["group"] = "vagrant"
-    provider_options = options.key?("virtualbox") ? options["virtualbox"] : {}
 
-    config.vm.define vm_name, autostart: autostart do |sys|
-      sys.vm.box = provider_options.key?("box") ? provider_options["box"] : "ubuntu/bionic64"
-      sys.vm.hostname = vm_name
+    config.vm.define hostname, autostart: autostart do |sys|
+      sys.vm.box = get_string(hostname, virtualbox, "box", default: "bento/ubuntu-26.04")
+      sys.vm.hostname = hostname
       sys.vm.provider "virtualbox" do |provider|
         provider.customize ["modifyvm", :id, "--natdnshostresolver1", "on"]
         provider.customize ["modifyvm", :id, "--natdnsproxy1", "on"]
-        provider.gui = provider_options.key?("gui") ? provider_options["gui"] : false
-        provider.memory = provider_options.key?("memory") ? provider_options["memory"] : 4096
+        provider.gui = get_boolean(hostname, virtualbox, "gui", default: false)
+        provider.memory = get_integer(hostname, virtualbox, "memory", default: 4096)
       end  # sys.vm.provider ... do |provider|
 
-      disk_size = provider_options.key?("disk_size") ? provider_options["disk_size"] : "default"
+      disk_size = get_string(hostname, virtualbox, "disk_size", default: "default")
       if disk_size != "default"
-        sys.disksize.size = disk_size
+        sys.disksize.size = disk_size  # Reboot the VM for the change to take effect.
       end
 
-      if provider_options.key?("network")
-        configure_virtualbox_network(sys, provider_options["network"])
-      end
+      network = get_hash(hostname, virtualbox, "network", default: {})
+      configure_virtualbox_network(hostname, sys, network)
 
-      update = provider_options.key?("update_guest_additions") ? provider_options["update_guest_additions"] : false
-      config.vbguest.auto_update = update
-      if update
+      update_guest_additions = get_boolean(hostname, virtualbox, "update_guest_additions", default: false)
+      config.vbguest.auto_update = update_guest_additions
+      if update_guest_additions
         sys.vm.provision "shell", reboot: true
       end
 
-      synced_folders(sys, options)
-      provision(sys, options)
+      synced_directories(hostname, sys, options)
+      provision(hostname, sys, options)
     end  # config.vm.define ... do |sys|
   end  # def self.configure_virtualbox()
 
-  # Configure a VirtualBox VM netowrk.
-  def self.configure_virtualbox_network(sys, network_options)
-    forwarded_ports = network_options.key?("forwarded_ports") ? network_options["forwarded_ports"] : []
-    forwarded_ports.each do |forwarded_port|
-      auto_correct = forwarded_port.key?("auto_correct") ? forwarded_port["auto_correct"] : false
-      protocol = forwarded_port.key?("protocol") ? forwarded_port["protocol"] : "tcp"
+  # Configure a VirtualBox VM network.
+  def self.configure_virtualbox_network(hostname, sys, network)
+    forwarded_ports = get_array(hostname, network, "forwarded_ports", default: [])
+    forwarded_ports.each do |port|
+      auto_correct = get_boolean(hostname, port, "auto_correct", default: false)
+      protocol = get_string(hostname, port, "protocol", default: "tcp")
       sys.vm.network "forwarded_port",
         auto_correct: auto_correct,
-        guest: forwarded_port["guest"],
-        host: forwarded_port["host"],
+        guest: get_integer(hostname, port, "remote", required: true),
+        host: get_integer(hostname, port, "host", required: true),
         protocol: protocol
-    end  # forwarded_ports.each do |forwarded_port|
+    end  # forwarded_ports.each do |port|
 
-    if network_options.key?("private_network")
-      if network_options["private_network"]["ip"] == "dhcp"
+    if network.key?("private_network")
+      private_network = get_hash(hostname, network, "private_network")
+      ip = get_string(hostname, private_network, "ip", required: true)
+      if ip == "dhcp"
         sys.vm.network "private_network", type: "dhcp"
       else
-        sys.vm.network "private_network", ip: network_options["private_network"]["ip"]
+        sys.vm.network "private_network", ip: ip
       end
-    end  # if network_options.key?("private_network")
-
-    if network_options.key?("public_network")
-      ip = network_options["public_network"]["ip"]
-      interfaces = network_options.key?("interfaces") ? network_options["interfaces"] : []
-      if (ip == "dhcp")
+    elsif network.key?("public_network")
+      public_network = get_hash(hostname, network, "public_network")
+      interfaces = get_array(hostname, public_network, "interfaces", default: [])
+      ip = get_string(hostname, public_network, "ip", required: true)
+      if ip == "dhcp"
         if interfaces.empty?
           sys.vm.network "public_network"
         else
           sys.vm.network "public_network", bridge: interfaces
         end
-      else  # ip == ip-address
+      else  # ip is an ip address
         if interfaces.empty?
           sys.vm.network "public_network", ip: ip
         else
           sys.vm.network "public_network", ip: ip, bridge: interfaces
         end
-      end  # if (ip == "dhcp") else (ip == ip-address)
-    end  # if network_options.key?("private_network")
+      end  # if ip == "dhcp" else ip is an ip address
+    end  # if network.key?("private_network") elsif network.key?("public_network")
 
-    if network_options.key?("usable_port_range")
-      start = network_options["usable_port_range"]["start"]
-      stop = network_options["usable_port_range"]["stop"]
+    if network.key?("usable_port_range")
+      usable_port_range = get_hash(hostname, network, "usable_port_range")
+      start = get_integer(hostname, usable_port_range, "start", required: true)
+      stop = get_integer(hostname, usable_port_range, "stop", required: true)
       sys.vm.usable_port_range = (start..stop)
     end
   end  # def self.configure_virtualbox_network()
 
-  # Recursively merge two values.
-  def self.merge_options(vm_option, default_option)
-    # If both are hashes, then merge them.
-    if vm_option.is_a?(Hash) && default_option.is_a?(Hash)
-      merged_option = {}
-      default_option.each do |key, default_value|
-        if vm_option.key?(key)
-          merged_option[key] = merge_options(vm_option[key], default_value)
-        else
-          merged_option[key] = default_value
-        end
-      end
-      vm_option.each do |key, vm_value|
-        if !default_option.key?(key)
-          merged_option[key] = vm_value
-        end
-      end
-      return merged_option
-    
-    # If both are arrays, then union them.
-    elsif vm_option.is_a?(Array) && default_option.is_a?(Array)
-      return vm_option | default_option
+  # Get an array option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # If the value is not an array, then raise a TypeError.
+  # Otherwise, return the array value with its nil elements removed.
+  def self.get_array(prefix, opts, key, required: false, default: nil)
+    prefix = prefix.to_s.empty? ? "" : "#{prefix}: "
+    value = get_option(prefix, opts, key, required, default)
+    return value if value.nil?
+    raise TypeError, "#{prefix}Value for '#{key}' must be a sequence, not a #{value.class}" unless value.is_a?(Array)
+    value.compact
+  end
 
-    # If they are of dissimilar types, or either is not a hash or array, the vm_option overrides the default_option.
-    else
-      return vm_option
-    end
-  end  # def self.merge_options()
+  # Get a boolean option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # If the value is not a boolean, then raise a TypeError.
+  # Otherwise, return the boolean value.
+  def self.get_boolean(prefix, opts, key, required: false, default: nil)
+    prefix = prefix.to_s.empty? ? "" : "#{prefix}: "
+    value = get_option(prefix, opts, key, required, default)
+    return value if value.nil?
+    raise TypeError,
+      "#{prefix}Value for '#{key}' must be a boolean, not a #{value.class}" unless value == true || value == false
+    value
+  end
+
+  # Get a hash option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # If the value is not a hash, then raise a TypeError.
+  # Otherwise, return the hash value.
+  def self.get_hash(prefix, opts, key, required: false, default: nil)
+    prefix = prefix.to_s.empty? ? "" : "#{prefix}: "
+    value = get_option(prefix, opts, key, required, default)
+    return value if value.nil?
+    raise TypeError, "#{prefix}Value for '#{key}' must be a mapping, not a #{value.class}" unless value.is_a?(Hash)
+    value
+  end
+
+  # Get an integer option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # If the value is not an integer, then raise a TypeError.
+  # Otherwise, return the integer value.
+  def self.get_integer(prefix, opts, key, required: false, default: nil)
+    prefix = prefix.to_s.empty? ? "" : "#{prefix}: "
+    value = get_option(prefix, opts, key, required, default)
+    return value if value.nil?
+    raise TypeError, "#{prefix}Value for '#{key}' must be an integer, not a #{value.class}" unless value.is_a?(Integer)
+    value
+  end
+
+  # Get an option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # Otherwise, return the value.
+  def self.get_option(prefix, opts, key, required, default)
+    raise KeyError, "#{prefix}Missing required key: '#{key}'" if !opts.key?(key) && required
+    return nil if !opts.key?(key) && !required && default.nil?
+    return default if !opts.key?(key) && !required && !default.nil?
+    value = opts[key]
+    raise ArgumentError, "#{prefix}Missing value for '#{key}'" if value.nil?
+    value
+  end
+
+  # Get a string option from the given options hash.
+  # If the key is missing, and it is required, then raise a KeyError.
+  # If the key is missing, and it is not required, then return the default value or nil.
+  # If the key is present, but the value is missing, then raise an ArgumentError.
+  # If the value is not a string, then raise a TypeError.
+  # Otherwise, return the string value.
+  def self.get_string(prefix, opts, key, required: false, default: nil)
+    prefix = prefix.to_s.empty? ? "" : "#{prefix}: "
+    value = get_option(prefix, opts, key, required, default)
+    return value if value.nil?
+    raise TypeError, "#{prefix}Value for '#{key}' must be a string, not a #{value.class}" unless value.is_a?(String)
+    value
+  end
 
   # Provisioning a VM.
-  def self.provision(sys, options)
-    provision_options = options.key?("provision") ? options["provision"] : {}
-    provision_dirs = provision_options.key?("dirs") ? provision_options["dirs"] : {}
-    provision_files = provision_options.key?("files") ? provision_options["files"] : {}
+  def self.provision(hostname, sys, options)
+    provision = get_hash(hostname, options, "provision", default: {})
 
-    ansible_dev_sys_options = options.key?("ansible_dev_sys") ? options["ansible_dev_sys"] : {}
-    bash_environment_options = options.key?("bash_environment") ? options["bash_environment"] : {}
+    dirs = get_array(hostname, provision, "dirs", default: [])
+    dirs.each do |dir|
+      host = get_string(hostname, dir, "host", required: true)
+      remote = get_string(hostname, dir, "remote", required: true)
+      dir_mode = get_string(hostname, dir, "dir_mode")
+      file_mode = get_string(hostname, dir, "file_mode")
 
-    provision_dirs.each do |dir|
-      sys.vm.provision "file", source: dir["host"], destination: dir["remote"]
-      if dir.key?("dir_mode")
-        command = "find #{dir["remote"]} -type d -exec chmod #{dir["dir_mode"]}" + ' {} \;'
+      sys.vm.provision "file", source: host, destination: remote
+      if dir_mode
+        command = "find #{remote} -type d -exec chmod #{dir_mode}" + ' {} \;'
         sys.vm.provision "shell", inline: command
       end
-      if dir.key?("file_mode")
-        command = "find #{dir["remote"]} -type f -exec chmod #{dir["file_mode"]}" + ' {} \;'
+      if file_mode
+        command = "find #{remote} -type f -exec chmod #{file_mode}" + ' {} \;'
         sys.vm.provision "shell", inline: command
       end
-    end  # provision_dirs.each do |dir|
+    end  # dirs.each do |dir|
 
-    provision_files.each do |file|
-      sys.vm.provision "file", source: file["host"], destination: file["remote"]
-      if file.key?("file_mode")
-        command = "chmod #{file["file_mode"]} #{file["remote"]}"
+    files = get_array(hostname, provision, "files", default: [])
+    files.each do |file|
+      host = get_string(hostname, file, "host", required: true)
+      remote = get_string(hostname, file, "remote", required: true)
+      file_mode = get_string(hostname, file, "file_mode")
+
+      sys.vm.provision "file", source: host, destination: remote
+      if file_mode
+        command = "chmod #{file_mode} #{remote}"
         sys.vm.provision "shell", inline: command
       end
-    end  # provision_files.each do |file|
+    end  # files.each do |file|
 
     sys.vm.provision "shell" do |shell|
       shell.keep_color = true
@@ -208,38 +271,40 @@ module Vagrant_Dev_Sys
         "DEV_SYS_GROUP" => options["group"]
       }
 
-      if ansible_dev_sys_options.key?("tags")
-        shell.env["ANSIBLE_DEV_SYS_TAGS"] = ansible_dev_sys_options["tags"].join(" ")
+      ansible_dev_sys = get_hash(hostname, options, "ansible_dev_sys", required: false, default: {})
+      if ansible_dev_sys.key?("dir")
+        shell.env["ANSIBLE_DEV_SYS_DIR"] = get_string(hostname, ansible_dev_sys, "dir")
+      elsif ansible_dev_sys.key?("version")
+        shell.env["ANSIBLE_DEV_SYS_VERSION"] = get_string(hostname, ansible_dev_sys, "version")
       end
+      tags = get_array(hostname, ansible_dev_sys, "tags", default: ["always"])
+      shell.env["ANSIBLE_DEV_SYS_TAGS"] = tags.join(" ")
 
-      if ansible_dev_sys_options.key?("dir")
-        shell.env["ANSIBLE_DEV_SYS_DIR"] = ansible_dev_sys_options["dir"]
-      elsif ansible_dev_sys_options.key?("version")
-        shell.env["ANSIBLE_DEV_SYS_VERSION"] = ansible_dev_sys_options["version"]
-      end
-
-      if bash_environment_options.key?("dir")
-        shell.env["BASH_ENVIRONMENT_DIR"] = bash_environment_options["dir"]
-      elsif bash_environment_options.key?("version")
-        shell.env["BASH_ENVIRONMENT_VERSION"] = bash_environment_options["version"]
+      bash_environment = get_hash(hostname, options, "bash_environment", required: false, default: {})
+      if bash_environment.key?("dir")
+        shell.env["BASH_ENVIRONMENT_DIR"] = get_string(hostname, bash_environment, "dir")
+      elsif bash_environment.key?("version")
+        shell.env["BASH_ENVIRONMENT_VERSION"] = get_string(hostname, bash_environment, "version")
       end
     end  # sys.vm.provision "shell"
   end  # def self.provision()
 
   # Define the synced folder and method.
-  def self.synced_folders(sys, options)
-    synced_folders = options.key?("synced_folders") ? options["synced_folders"] : {}
-
+  def self.synced_directories(hostname, sys, options)
     sys.vm.synced_folder ".", "/vagrant", disabled: true
-    synced_folders.each do |folder|
-      sys.vm.synced_folder folder["host"], folder["remote"],
+
+    synced_directories = get_array(hostname, options, "synced_directories", default: [])
+    synced_directories.each do |directory|
+      host = get_string(hostname, directory, "host", required: true)
+      remote = get_string(hostname, directory, "remote", required: true)
+      sys.vm.synced_folder host, remote,
         type: "rsync",
         create: "true",
         rsync__args: ["-lrtz"],
-        rsync__exclude: [".git/", ".gitignore"],
+        rsync__exclude: [".claude/", ".git/", ".gitignore", ".vscode/"],
         rsync__verbose: "true"
-    end  # synced_folders.each do |folder|
-  end  # def self.synced_folders()
+    end  # synced_directories.each do |directory|
+  end  # def self.synced_directories()
 end  # module Vagrant_Dev_Sys
 
 Vagrant_Dev_Sys.configure
