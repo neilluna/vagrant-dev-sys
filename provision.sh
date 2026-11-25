@@ -14,6 +14,7 @@ function echo_usage()
 	echo ""
 	echo "Usage: ${SCRIPT_NAME} [options]"
 	echo ""
+	echo "Options:"
 	echo "      --help     Output this help information."
 	echo "  -v, --version  Output the version."
 }

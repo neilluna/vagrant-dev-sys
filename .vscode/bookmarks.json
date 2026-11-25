@@ -14,16 +14,6 @@
 					"label": ""
 				}
 			]
-		},
-		{
-			"path": "provision.sh",
-			"bookmarks": [
-				{
-					"line": 364,
-					"column": 0,
-					"label": ""
-				}
-			]
 		}
 	]
 }
